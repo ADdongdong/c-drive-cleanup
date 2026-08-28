@@ -173,6 +173,38 @@ def classify(name):
         return 'B'
     return '?'
 
+# ---------- 已知文件夹检测（D类: 用户个人静态文件） ----------
+
+KNOWN_FOLDERS = {
+    'Desktop(桌面)':   '{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}',
+    'Documents(文档)': '{FDD39AD0-238F-46AF-ADB4-6C85480369C7}',
+    'Downloads(下载)': '{374DE290-123F-4565-9164-39C4925E467B}',
+    'Pictures(图片)':  '{33E28130-4E1E-4676-835A-98395C3BC3BB}',
+    'Music(音乐)':     '{4BD8D571-6D19-48D3-BE97-422220080E43}',
+    'Videos(视频)':    '{18989B1D-99B5-455B-841C-AB7C74E4DDFC}',
+}
+
+def known_folder_paths():
+    """用 SHGetKnownFolderPath 获取已知文件夹真实位置。
+    坑: 注册表 HKCU...User Shell Folders 可能为空, 不要依赖它"""
+    import uuid
+
+    def known_path(fid_str):
+        class GUID(ctypes.Structure):
+            _fields_ = [('Data1', ctypes.c_ulong), ('Data2', ctypes.c_ushort),
+                        ('Data3', ctypes.c_ushort), ('Data4', ctypes.c_ubyte * 8)]
+        u = uuid.UUID(fid_str)
+        g = GUID(u.time_low, u.time_mid, u.time_hi_version, (ctypes.c_ubyte * 8)(*u.bytes[8:]))
+        buf = ctypes.c_void_p()
+        r = ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(g), 0, None, ctypes.byref(buf))
+        if r != 0:
+            return None
+        path = ctypes.wstring_at(buf)
+        ctypes.windll.ole32.CoTaskMemFree(buf)
+        return path
+
+    return {label: known_path(fid) for label, fid in KNOWN_FOLDERS.items()}
+
 # ---------- 主流程 ----------
 
 def main():
@@ -220,6 +252,18 @@ def main():
             if size >= min_size:
                 cat = classify(name)
                 buckets[cat].append((fmt(size), name, full))
+
+    print('\n' + '=' * 62)
+    print('已知文件夹位置(D类: 用户个人文件, 只报告不自动处理):')
+    kf = known_folder_paths()
+    for label, path in kf.items():
+        if not path:
+            print(f'  {label:<16} (获取失败)')
+            continue
+        on_c = path.upper().startswith(str(SYSTEM_DRIVE).upper())
+        size_str = fmt(get_dir_size(path)) if on_c and os.path.exists(path) else '-'
+        tag = f'← 在{SYSTEM_DRIVE}盘 {size_str:>10}  → 官方法: 右键→属性→位置→移动' if on_c else '(不在系统盘)'
+        print(f'  {label:<16} {path}  {tag}')
 
     print('\n' + '=' * 62)
     print('已存在的 Junction（数据已在其他盘, 跳过）:')
