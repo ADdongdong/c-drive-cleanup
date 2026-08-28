@@ -254,7 +254,7 @@ def main():
                 buckets[cat].append((fmt(size), name, full))
 
     print('\n' + '=' * 62)
-    print('已知文件夹位置(D类: 用户个人文件, 只报告不自动处理):')
+    print('已知文件夹位置(D类: 报告后征求用户选择, 确认前不处理):')
     kf = known_folder_paths()
     for label, path in kf.items():
         if not path:
