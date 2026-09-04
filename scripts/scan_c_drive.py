@@ -2,10 +2,18 @@
 # -*- coding: utf-8 -*-
 """C盘空间检测脚本（c-drive-cleanup skill 阶段1）
 只读扫描，不删除不修改任何文件。
-用法: python scan_c_drive.py [--quick] [--target D]
+用法: python scan_c_drive.py [--quick] [--target D] [--json out.json]
   --quick: 跳过深层目录，只扫关键位置
   --target D: 指定迁移目标盘（缺省自动选空闲最大的非系统盘）
-输出: A类(可清理) / B类(可Junction迁移) / C类(不动) 分类建议
+  --json out.json: 把扫描结果写入 JSON（供 migrate_junction.py / 后续阶段复用, 免重复扫描）
+输出: A类(可清理) / B类(可Junction迁移) / C类(不动) / D类(个人文件) / S类(敏感数据) 分类建议
+
+v1.2 安全加固（事故教训）:
+- 新增 S 类敏感数据（聊天记录/邮件/密码库），识别后只报告不自动处理，
+  迁移须走 wechat_doctor.py / 强制备份流程
+- classify() 加路径限定：A/B 判定只在 AppData 顶层生效，
+  避免 %USERPROFILE%\\code（个人源码）被判成迁移、%USERPROFILE%\\temp 被判成可清理
+- 回收站 = 个人数据：只统计大小和条数，明细用 recycle_bin.py，禁止整体清空
 
 坑位说明（实测）:
 - Python 3.12+ 中 junction 的 entry.is_dir(follow_symlinks=False) 返回 False，
@@ -14,7 +22,15 @@
 """
 import os
 import sys
+import json
 import ctypes
+import argparse
+import datetime
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import expand, norm_path, S_RULES  # S_RULES 定义在 common.py（各脚本共用一份）
 
 USER_HOME = os.path.expanduser('~')          # 当前用户的家目录（通用）
 SYSTEM_DRIVE = os.environ.get('SystemDrive', 'C:').rstrip(':') + ':'
@@ -71,28 +87,34 @@ def is_junction(path):
     return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT) if attrs != -1 else False
 
 def get_dir_size(path):
-    """统计目录大小，但剪枝 junction 子目录（不把其他盘的数据算进来）"""
+    """统计目录大小，但剪枝 junction 子目录（不把其他盘的数据算进来）。
+    提速: scandir 迭代 + entry.stat(follow_symlinks=False).st_size
+    （比 os.walk + os.path.getsize 每文件少一次系统调用，几十万小文件时差距明显）"""
     total = 0
-    for root, dirs, files in os.walk(path):
-        pruned = []
-        for d in dirs:
-            full = os.path.join(root, d)
-            if is_junction(full):
-                NESTED_JUNCTIONS.append((full, _safe_readlink(full)))
-            else:
-                pruned.append(d)
-        dirs[:] = pruned
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                pass
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if is_junction(entry.path):
+                            NESTED_JUNCTIONS.append((entry.path, _safe_readlink(entry.path)))
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        else:
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return total
 
 def _safe_readlink(path):
     try:
         return os.readlink(path)
-    except OSError:
+    except (OSError, ValueError):
+        # 坑: OneDrive 占位符等 reparse point 不是符号链接, readlink 抛 ValueError 而非 OSError
         return '?'
 
 def fmt(size):
@@ -110,48 +132,56 @@ def disk_space(drive):
     kernel32.GetDiskFreeSpaceExW(drive, None, ctypes.pointer(total), ctypes.pointer(free))
     return total.value / 2**30, free.value / 2**30
 
-def list_dirs(base, top=30, min_size=50*2**20):
-    """列出 base 下子目录, 按大小排序; junction 单独标记(不参与top截断)"""
-    junctions, dirs_only = [], []
+def list_dirs(base, top=30, min_size=50*2**20, workers=8):
+    """列出 base 下子目录, 按大小排序; junction 单独标记(不参与top截断)。
+    提速: 顶层子目录大小统计用线程池并行（IO 密集, 8 workers 约快 3-5 倍）"""
+    junctions, dir_paths = [], []
     try:
         for entry in os.scandir(base):
             full = entry.path
             if is_junction(full):
                 junctions.append((entry.name, -1, True))
             elif entry.is_dir():
-                dirs_only.append((entry.name, get_dir_size(full), False))
+                dir_paths.append((entry.name, full))
     except OSError:
         pass
+    sizes = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(get_dir_size, full): name for name, full in dir_paths}
+        for fut in as_completed(futures):
+            sizes[futures[fut]] = fut.result()
+    dirs_only = [(name, sizes.get(name, 0), False) for name, _ in dir_paths]
     dirs_only.sort(key=lambda x: -x[1])
     return junctions + dirs_only[:top], min_size
 
-# ---------- 分类规则（实测沉淀） ----------
+# ---------- 分类规则（实测沉淀, v1.2） ----------
 
-A_CLEAN = {  # A类: 可直接清理
+A_CLEAN = {  # A类: 可直接清理（黄灯命令仅限本清单 + A_PATH_ALLOW 白名单路径）
     'temp': '临时文件（先看大文件内容, wsl-crashes/*.dmp 崩溃转储可放心删）',
     'wsl-crashes': 'WSL 崩溃转储（反复暴涨说明容器有问题）',
     'diagoutputdir': '诊断日志',
     'squirreltemp': '应用安装器缓存',
-    'pip': 'pip 缓存 → pip cache purge',
-    '.cache': 'AI模型/工具缓存（删后重新下载, 需确认）',
+    'pip': 'pip 缓存 → pip cache purge（仅 Local\\pip）',
+    '.cache': 'AI模型/工具缓存（删后重新下载, 需确认, 仅 AppData 下）',
 }
 B_JUNCTION = {  # B类: Junction 迁移安全清单
     'kingsoft': 'WPS 数据',
-    'google': 'Chrome 数据',
-    'tencent': 'QQ/微信/企微（隐藏占用: WeType/WXWork/TencentDocs）',
+    'google': 'Chrome 数据（密码/书签属敏感项, 迁移前备份 Login Data）',
     'larkshell': '飞书',
-    'code': 'VS Code 数据',
+    'code': 'VS Code 数据（仅 AppData 下）',
     'tdappdesktop': '通达信（隐藏占用: TencentDocs 当 user-data-dir）',
     'jetbrains': 'JetBrains（Roaming 和 Local 各一个都要迁）',
     'docker': 'Docker WSL 虚拟磁盘（若本地仅剩小日志=已迁移）',
     '.codebuddy': 'CodeBuddy CLI（需关 CodeBuddy CN）',
     '.codebuddycn': 'CodeBuddy CN 扩展（需关 CodeBuddy CN）',
-    'dingtalk': '钉钉',
+    'dingtalk': '钉钉（聊天附件属敏感项, 先备份）',
     'qqex': 'QQ浏览器',
     'xmind': 'Xmind',
     'githubdesktop': 'GitHub Desktop',
     'doubao': '豆包',
     'steam': 'Steam',
+    # v1.2: 'tencent' 整包已移除 —— Roaming\\Tencent 含 40+ 子应用（QQNT/WXWork/TIM/WeDrive），
+    # 整包迁移粒度太粗是微信事故诱因之一。微信走 wechat_doctor.py，其余按子应用逐个评估
 }
 C_KEEP = {  # C类: 不动
     'microsoft': '系统组件/Edge/OneDrive',
@@ -161,17 +191,96 @@ C_KEEP = {  # C类: 不动
     'anaconda3': '路径硬编码 → 用 conda clean --all',
     '.workbuddy': 'Agent运行自身目录（运行中被锁, 需独立脚本+退出应用）',
     'packages': '系统组件包',
+    'tencent': '腾讯系数据根（含微信/QQ聊天库, 禁止整包迁移, 微信走 wechat_doctor.py）',
 }
 
-def classify(name):
+def classify(name, full_path=''):
+    """分类优先级: C > S > A > B > ?（v1.2 起带路径限定）
+    坑（事故教训）: 之前按目录名全等匹配、不限路径，导致
+    %USERPROFILE%\\code（个人源码）被判成 B 类建议迁移、
+    %USERPROFILE%\\temp 被判成 A 类建议清理。现在 A/B 只在 AppData 下生效。"""
     key = name.lower()
+    norm = norm_path(full_path) if full_path else ''
+    in_appdata = ('\\appdata\\local' in norm or '\\appdata\\roaming' in norm)
+
+    # S 类最先于 A/B：哪怕目录名叫 temp，只要里面是聊天库就不能按缓存处理
+    if norm:
+        for pat, _note in S_RULES:
+            if re.search(pat, norm):
+                return 'S'
+
     if key in C_KEEP:
         return 'C'
     if key in A_CLEAN:
-        return 'A'
+        # 路径限定: A 类判定只在 AppData 下生效（家目录下的 temp/.cache 可能是个人目录）
+        return 'A' if in_appdata else '?'
     if key in B_JUNCTION:
-        return 'B'
+        return 'B' if in_appdata else '?'
     return '?'
+
+# ---------- 回收站概览（v1.2: 只统计, 不清空） ----------
+
+def recycle_bin_overview():
+    """统计各盘 $Recycle.Bin 大小。v1.2 事故教训: 回收站是个人数据重灾区
+    （一起事故里 14647 个个人文件被整体清空），本脚本只报占用，
+    明细列表用 recycle_bin.py，清理必须逐条确认。"""
+    import string
+    items = []
+    for letter in string.ascii_uppercase:
+        drive = f'{letter}:'
+        if not os.path.exists(drive + '\\'):
+            continue
+        rb = os.path.join(drive, '$Recycle.Bin')
+        if not os.path.isdir(rb):
+            continue
+        size = get_dir_size(rb)
+        if size > 2**20:  # 超过 1MB 才报
+            items.append({'drive': drive, 'bytes': size, 'size': fmt(size)})
+    return items
+
+# ---------- 敏感数据探测（v1.2: S 类只报告, 不自动处理） ----------
+
+def sensitive_probe():
+    """探测常见敏感数据位置（微信聊天库/Outlook/密码库）。
+    只做 exists + 大小统计，任何清理/迁移动作都须走专门流程。"""
+    found = []
+    # 微信 4.x: config ini 指定真实数据根（实测: 单行路径, 编码可能是 utf-8/utf-16/gbk）
+    ini_dir = expand(r'%APPDATA%\Tencent\xwechat\config')
+    ini_roots = []
+    if os.path.isdir(ini_dir):
+        try:
+            for fn in os.listdir(ini_dir):
+                if not fn.endswith('.ini'):
+                    continue
+                raw = open(os.path.join(ini_dir, fn), 'rb').read()
+                for enc in ('utf-8', 'utf-16', 'gbk'):
+                    try:
+                        line = raw.decode(enc).strip().splitlines()
+                        if line and line[0]:
+                            ini_roots.append(line[0])
+                            break
+                    except (UnicodeDecodeError, UnicodeError):
+                        continue
+        except OSError:
+            pass
+    candidates = [
+        ('微信4.x账号数据根(xwechat_files)', expand(r'%USERPROFILE%\xwechat_files')),
+        ('微信3.x数据(WeChat Files)', os.path.join(USER_HOME, 'Documents', 'WeChat Files')),
+        ('微信4.x运行时+配置', expand(r'%APPDATA%\Tencent\xwechat')),
+        ('微信旧版数据', expand(r'%APPDATA%\Tencent\WeChat')),
+        ('Outlook邮件', expand(r'%LOCALAPPDATA%\Microsoft\Outlook')),
+        ('Chrome密码库', expand(r'%LOCALAPPDATA%\Google\Chrome\User Data\Default\Login Data')),
+    ]
+    for label, p in [(f'微信数据根(来自config ini)', r) for r in ini_roots] + candidates:
+        try:
+            if p and os.path.exists(p):
+                sz = get_dir_size(p) if os.path.isdir(p) else os.path.getsize(p)
+                on_c = norm_path(p).startswith(norm_path(SYSTEM_DRIVE + '\\'))
+                found.append({'label': label, 'path': p, 'bytes': sz, 'size': fmt(sz),
+                              'on_system_drive': on_c})
+        except OSError:
+            continue
+    return found
 
 # ---------- 已知文件夹检测（D类: 用户个人静态文件） ----------
 
@@ -208,15 +317,20 @@ def known_folder_paths():
 # ---------- 主流程 ----------
 
 def main():
-    quick = '--quick' in sys.argv
-    # --target D 形式指定目标盘；缺省自动选空闲最大的非系统盘
-    target_drive = None
-    if '--target' in sys.argv:
-        idx = sys.argv.index('--target')
-        if idx + 1 < len(sys.argv):
-            target_drive = pick_target_drive(sys.argv[idx + 1])
-    else:
-        target_drive = pick_target_drive()
+    ap = argparse.ArgumentParser(description='C盘空间检测（只读, 不删不改）')
+    ap.add_argument('--quick', action='store_true', help='跳过深层目录, 只扫关键位置')
+    ap.add_argument('--target', default=None, help='指定迁移目标盘, 如 D')
+    ap.add_argument('--json', dest='json_out', default=None, help='扫描结果写入 JSON 文件（复用免重扫）')
+    args = ap.parse_args()
+    quick = args.quick
+    target_drive = pick_target_drive(args.target) if args.target else pick_target_drive()
+
+    report = {
+        'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'system_drive': SYSTEM_DRIVE,
+        'quick': quick,
+        'target_drive': target_drive,
+    }
 
     total, free = disk_space(SYSTEM_DRIVE)
     print('=' * 62)
@@ -229,6 +343,8 @@ def main():
     data_drives = available_data_drives()
     print(f'可用数据盘: {", ".join(data_drives) if data_drives else "(无)"}')
     print('=' * 62)
+    report['disk'] = {'total_gb': round(total, 1), 'free_gb': round(free, 1),
+                      'data_drives': data_drives}
 
     scan_targets = [
         ('AppData\\Local', LOCAL),
@@ -237,33 +353,75 @@ def main():
     if not quick:
         scan_targets.append(('用户主目录', USER_HOME))
 
-    buckets = {'A': [], 'B': [], 'C': [], '?': []}
+    buckets = {'A': [], 'B': [], 'C': [], 'S': [], '?': []}
     junctions_found = []
+    report['scans'] = []
 
     for label, base in scan_targets:
         print(f'\n### {label} ###')
         dirs, min_size = list_dirs(base)
+        entries = []
         for name, size, junc in dirs:
             full = os.path.join(base, name)
             if junc:
                 junctions_found.append((full, _safe_readlink(full)))
+                entries.append({'name': name, 'bytes': -1, 'junction': True})
                 continue
             print(f'  {fmt(size):>10}  {name}')
+            entries.append({'name': name, 'bytes': size, 'junction': False})
             if size >= min_size:
-                cat = classify(name)
-                buckets[cat].append((fmt(size), name, full))
+                cat = classify(name, full)
+                buckets[cat].append((fmt(size), name, full, size))
+        report['scans'].append({'label': label, 'base': base, 'entries': entries})
+
+    report['buckets'] = {cat: [{'size': b[0], 'bytes': b[3], 'name': b[1], 'path': b[2]}
+                               for b in items] for cat, items in buckets.items()}
 
     print('\n' + '=' * 62)
     print('已知文件夹位置(D类: 报告后征求用户选择, 确认前不处理):')
     kf = known_folder_paths()
+    kf_report = []
     for label, path in kf.items():
         if not path:
             print(f'  {label:<16} (获取失败)')
+            kf_report.append({'label': label, 'path': None})
             continue
         on_c = path.upper().startswith(str(SYSTEM_DRIVE).upper())
-        size_str = fmt(get_dir_size(path)) if on_c and os.path.exists(path) else '-'
+        size = get_dir_size(path) if on_c and os.path.exists(path) else None
+        size_str = fmt(size) if size is not None else '-'
         tag = f'← 在{SYSTEM_DRIVE}盘 {size_str:>10}  → 官方法: 右键→属性→位置→移动' if on_c else '(不在系统盘)'
         print(f'  {label:<16} {path}  {tag}')
+        kf_report.append({'label': label, 'path': path, 'on_system_drive': on_c,
+                          'bytes': size})
+    report['known_folders'] = kf_report
+
+    # v1.2: 回收站概览（只统计大小, 不清空; 明细用 recycle_bin.py）
+    print('\n' + '=' * 62)
+    print('回收站占用（个人数据! 只统计不清空, 明细: python recycle_bin.py --scan）:')
+    rb_items = recycle_bin_overview()
+    if rb_items:
+        for it in rb_items:
+            print(f'  {it["drive"]}盘回收站: {it["size"]:>10}')
+    else:
+        print('  (无 ≥1MB 的回收站)')
+    report['recycle_bin'] = rb_items
+
+    # v1.2: 敏感数据探测（S 类只报告; 迁移须走 wechat_doctor.py / 强制备份流程）
+    print('\n' + '=' * 62)
+    print('敏感数据探测（S类: 聊天记录/邮件/密码库, 丢失不可逆, 禁止自动清理/迁移）:')
+    sens = sensitive_probe()
+    if sens:
+        for it in sens:
+            loc = '在C盘' if it['on_system_drive'] else '不在C盘(无需处理)'
+            print(f'  {it["size"]:>10}  {it["label"]}  {loc}')
+            print(f'{" ":>12}  {it["path"]}')
+        on_c = [it for it in sens if it['on_system_drive']]
+        if on_c:
+            print('  ⚠ C盘上有敏感数据: 微信用 wechat_doctor.py --detect 专项处理;')
+            print('    其他敏感项迁移前必须先做完整只读备份（见 SKILL.md S类规范）')
+    else:
+        print('  (未发现)')
+    report['sensitive'] = sens
 
     print('\n' + '=' * 62)
     print('已存在的 Junction（数据已在其他盘, 跳过）:')
@@ -280,31 +438,39 @@ def main():
                 print(f'  {full}\n    -> {target}')
     if not junctions_found and not NESTED_JUNCTIONS:
         print('  (无)')
+    report['existing_junctions'] = [{'path': f, 'target': t}
+                                    for f, t in junctions_found]
+    report['nested_junctions'] = [{'path': f, 'target': t} for f, t in NESTED_JUNCTIONS]
 
     for cat, title, action in [
-        ('A', 'A类: 可直接清理（删除不影响使用, 需确认后执行）', '清理'),
-        ('B', 'B类: 建议Junction迁移到数据盘（迁移后不影响使用）', '迁移'),
+        ('A', 'A类: 可直接清理（删除不影响使用, 需确认后执行; /MIR与rmtree仅限白名单路径）', '清理'),
+        ('B', 'B类: 建议Junction迁移到数据盘（迁移后不影响使用, 迁移走状态机）', '迁移'),
+        ('S', 'S类: 敏感数据（聊天记录/邮件/密码库, 丢失不可逆 —— 只报告, 不自动处理）', '专项流程'),
         ('C', 'C类: 不建议动', '保持'),
         ('?', '待判断（需查看内容后决定）', '查看'),
     ]:
         print(f'\n### {title} ###')
         if not buckets[cat]:
             print('  (无)')
-        for size, name, full in buckets[cat]:
-            note = A_CLEAN.get(name.lower(), B_JUNCTION.get(name.lower(), C_KEEP.get(name.lower(), '')))
-            print(f'  {size:>10}  {name:<28} {note}')
+        for size_str, name, full, _bytes in buckets[cat]:
+            note = (A_CLEAN.get(name.lower()) or B_JUNCTION.get(name.lower())
+                    or C_KEEP.get(name.lower()) or '')
+            if cat == 'S':
+                for pat, s_note in S_RULES:
+                    if re.search(pat, norm_path(full)):
+                        note = s_note
+                        break
+            print(f'  {size_str:>10}  {name:<28} {note}')
             if cat in ('A', 'B'):
                 print(f'{" ":>12}→ {action}: {full}')
                 if cat == 'B' and target_drive:
                     print(f'{" ":>12}→ Junction 目标: {junction_base(target_drive)}\\{name}')
+            if cat == 'S':
+                print(f'{" ":>12}→ 禁止直接清理/迁移。微信走 wechat_doctor.py; 其他先完整备份')
 
     # 容量校验: 目标盘空闲空间 vs B类待迁移总量(需>1.2倍余量, 迁移过程中源数据还在)
     if target_drive and buckets['B']:
-        def _to_bytes(s):
-            num, unit = s.split()
-            mult = {'GB': 2**30, 'MB': 2**20, 'KB': 2**10}[unit]
-            return float(num) * mult
-        need = sum(_to_bytes(s) for s, _, _ in buckets['B'])
+        need = sum(b[3] for b in buckets['B'])
         avail = _drive_free(target_drive)
         ratio = avail / need if need else 0
         print('\n' + '=' * 62)
@@ -314,10 +480,20 @@ def main():
         else:
             print(f'✗ 容量不足! 建议只迁移最大的前几项, 或先做A类清理腾出目标盘空间')
             # 按大小降序列出可优先迁移的项
-            ranked = sorted(buckets['B'], key=lambda x: -_to_bytes(x[0]))
-            print('  建议优先迁移:', ', '.join(f'{n}({s})' for s, n, _ in ranked[:3]))
+            ranked = sorted(buckets['B'], key=lambda x: -x[3])
+            print('  建议优先迁移:', ', '.join(f'{n}({s})' for s, n, _, _ in ranked[:3]))
+        report['capacity_check'] = {'need_bytes': need, 'avail_bytes': avail,
+                                    'ratio': round(ratio, 2), 'sufficient': ratio >= 1.2}
 
-    print('\n提示: A类清理前必须列出清单并经用户确认; B类按 SKILL.md 阶段4 八步流程执行。')
+    print('\n提示: A类清理前必须列出清单并经用户确认（/MIR、rmtree 仅限 A_PATH_ALLOW 白名单）;')
+    print('     B类用 python migrate_junction.py --dirs 短名 --dry-run 预演后执行;')
+    print('     S类敏感数据一律走专项流程, 禁止直接删/迁; 回收站用 recycle_bin.py 列明细逐条确认。')
+
+    if args.json_out:
+        with open(args.json_out, 'w', encoding='utf-8') as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        print(f'扫描结果已写入: {args.json_out}')
+
 
 if __name__ == '__main__':
     main()
